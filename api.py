@@ -16,7 +16,9 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph.message import add_messages
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
-
+from fastapi import File, UploadFile
+import requests
+from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 # ==========================================
 # 1. 全局初始化
 # ==========================================
@@ -91,7 +93,69 @@ app.add_middleware(
 class ChatRequest(BaseModel):
     query: str
     session_id: str
+@app.post("/upload")
+async def upload_document(file: UploadFile = File(...)):
+    """
+    接收前端上传的文件，调用大模型解析，切片后动态追加到 FAISS 向量库
+    """
+    try:
+        # 1. 将上传的文件暂存到本地
+        temp_file_path = f"temp_{file.filename}"
+        with open(temp_file_path, "wb") as f:
+            f.write(await file.read())
 
+        api_key = os.environ.get("DASHSCOPE_API_KEY")
+
+        # 2. 上传至阿里云百炼获取 file_id
+        upload_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/files"
+        headers_upload = {"Authorization": f"Bearer {api_key}"}
+        data = {"purpose": "file-extract"}
+        files = {"file": open(temp_file_path, "rb")}
+        
+        upload_res = requests.post(upload_url, headers=headers_upload, files=files, data=data).json()
+        if "id" not in upload_res:
+            raise Exception(f"阿里云文件上传失败: {upload_res}")
+        file_id = upload_res["id"]
+
+        # 3. 调用 qwen-long 提取 Markdown
+        chat_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+        headers_chat = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        payload = {
+            "model": "qwen-long",
+            "messages": [
+                {"role": "system", "content": "你是一个严谨的结构化数据提取工程师。请提取用户上传文档的全部内容，严格按 Markdown 格式输出。保留多级标题和表格。"},
+                {"role": "system", "content": f"fileid://{file_id}"},
+                {"role": "user", "content": "请全面解析这份文档。"}
+            ]
+        }
+        chat_res = requests.post(chat_url, headers=headers_chat, json=payload).json()
+        if "choices" not in chat_res:
+            raise Exception(f"大模型解析失败: {chat_res}")
+        markdown_content = chat_res["choices"][0]["message"]["content"]
+
+        # 4. 语义切片
+        headers_to_split_on = [("#", "一级标题"), ("##", "二级标题"), ("###", "三级标题")]
+        markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on, strip_headers=False)
+        md_header_splits = markdown_splitter.split_text(markdown_content)
+        
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=50)
+        final_splits = text_splitter.split_documents(md_header_splits)
+
+        # 5. 动态追加到现有的 FAISS 向量库中，并持久化到本地硬盘
+        global vectorstore
+        vectorstore.add_documents(final_splits)
+        vectorstore.save_local("faiss_gb47372_index")
+
+        # 6. 清理临时文件
+        os.remove(temp_file_path)
+
+        return {
+            "status": "success", 
+            "message": f"文件 {file.filename} 解析入库成功！共新增 {len(final_splits)} 个知识块。"
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 # 3. 路由定义
 @app.post("/chat/stream")
 async def chat_stream_endpoint(request: ChatRequest):
