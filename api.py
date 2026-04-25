@@ -13,12 +13,15 @@ from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_community.chat_models import ChatTongyi
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.tools import tool
 from langgraph.graph.message import add_messages
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.memory import MemorySaver
+import sqlite3
+from langgraph.checkpoint.sqlite import SqliteSaver
 from fastapi import File, UploadFile
-import requests
+import httpx
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 # ==========================================
 # 1. 全局初始化
 # ==========================================
@@ -36,8 +39,16 @@ vectorstore = FAISS.load_local(
     allow_dangerous_deserialization=True 
 )
 retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+
+@tool
+def search_knowledge_base(query: str) -> str:
+    """检索企业内部的规范文档上下文。当用户询问与公司制度、技术规范、业务流程等文档相关的问题时，使用此工具获取参考信息。"""
+    docs = retriever.invoke(query)
+    return "\n\n".join(doc.page_content for doc in docs)
+
 # 注意：开启流式输出 streaming=True
 llm = ChatTongyi(model="qwen-turbo", temperature=0.1, streaming=True)
+llm_with_tools = llm.bind_tools([search_knowledge_base])
 
 # ==========================================
 # 2. 定义 LangGraph 逻辑 (保持不变)
@@ -45,12 +56,63 @@ llm = ChatTongyi(model="qwen-turbo", temperature=0.1, streaming=True)
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
     context: str
+    intent: str
+    search_query: str
+
+def rewrite_query_node(state: AgentState):
+    """查询改写节点：结合历史对话将最新提问改写为独立查询语句"""
+    messages = state["messages"]
+    latest_message = messages[-1].content
+
+    history_str = ""
+    for msg in messages[:-1]:
+        role = "用户" if isinstance(msg, HumanMessage) else "助手"
+        history_str += f"{role}: {msg.content}\n"
+
+    if history_str.strip():
+        prompt = f"""以下是历史对话记录：
+{history_str}
+用户最新提问：{latest_message}
+
+请将用户的最新提问改写为一个完整的、独立的问题，使其脱离上下文也能被准确理解。只输出改写后的问题，不要输出其他内容。"""
+        response = llm.invoke([HumanMessage(content=prompt)])
+        rewritten = response.content.strip()
+    else:
+        rewritten = latest_message
+
+    return {"search_query": rewritten}
 
 def retrieve_node(state: AgentState):
-    latest_message = state["messages"][-1].content
-    docs = retriever.invoke(latest_message)
+    search_query = state["search_query"]
+    docs = retriever.invoke(search_query)
     context_str = "\n\n".join(doc.page_content for doc in docs)
     return {"context": context_str}
+
+def router_node(state: AgentState):
+    """意图识别节点：判断用户输入是'文档问答'还是'日常寒暄'"""
+    user_input = state["messages"][-1].content
+    prompt = f"""请判断以下用户输入的意图类别，只能从以下两个选项中选择一个：
+- 文档问答：用户在询问与文档、知识库相关的问题
+- 日常寒暄：用户在进行打招呼、闲聊等非知识库相关的对话
+
+用户输入：{user_input}
+
+请只输出类别名称（文档问答 或 日常寒暄），不要输出其他内容。"""
+    response = llm.invoke([HumanMessage(content=prompt)])
+    intent = response.content.strip()
+    if "寒暄" in intent:
+        intent = "日常寒暄"
+    else:
+        intent = "文档问答"
+    return {"intent": intent}
+
+def direct_answer_node(state: AgentState):
+    """日常寒暄处理节点：直接给出友好回复"""
+    messages = state["messages"]
+    system_prompt = "你是一个友好的 AI 助手。用户正在进行日常寒暄或闲聊，请自然、简洁地回应。"
+    conversation = [SystemMessage(content=system_prompt)] + list(messages)
+    response = llm.invoke(conversation)
+    return {"messages": [response]}
 
 def generate_node(state: AgentState):
     messages = state["messages"]
@@ -65,15 +127,27 @@ def generate_node(state: AgentState):
     response = llm.invoke(conversation)
     return {"messages": [response]}
 
+def route_intent(state: AgentState) -> str:
+    """根据意图识别结果决定路由方向"""
+    if state.get("intent") == "日常寒暄":
+        return "direct_answer"
+    return "rewrite_query"
+
 workflow = StateGraph(AgentState)
+workflow.add_node("router", router_node)
+workflow.add_node("rewrite_query", rewrite_query_node)
 workflow.add_node("retrieve", retrieve_node)
 workflow.add_node("generate", generate_node)
-workflow.add_edge(START, "retrieve")
+workflow.add_node("direct_answer", direct_answer_node)
+
+workflow.add_edge(START, "router")
+workflow.add_conditional_edges("router", route_intent, {"rewrite_query": "rewrite_query", "direct_answer": "direct_answer"})
+workflow.add_edge("rewrite_query", "retrieve")
 workflow.add_edge("retrieve", "generate")
 workflow.add_edge("generate", END)
+workflow.add_edge("direct_answer", END)
 
-memory = MemorySaver()
-graph_app = workflow.compile(checkpointer=memory)
+
 
 # ==========================================
 # 3. 搭建 FastAPI 服务
@@ -98,9 +172,9 @@ async def upload_document(file: UploadFile = File(...)):
     """
     接收前端上传的文件，调用大模型解析，切片后动态追加到 FAISS 向量库
     """
+    temp_file_path = f"temp_{file.filename}"
     try:
         # 1. 将上传的文件暂存到本地
-        temp_file_path = f"temp_{file.filename}"
         with open(temp_file_path, "wb") as f:
             f.write(await file.read())
 
@@ -110,28 +184,33 @@ async def upload_document(file: UploadFile = File(...)):
         upload_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/files"
         headers_upload = {"Authorization": f"Bearer {api_key}"}
         data = {"purpose": "file-extract"}
-        files = {"file": open(temp_file_path, "rb")}
-        
-        upload_res = requests.post(upload_url, headers=headers_upload, files=files, data=data).json()
-        if "id" not in upload_res:
-            raise Exception(f"阿里云文件上传失败: {upload_res}")
-        file_id = upload_res["id"]
 
-        # 3. 调用 qwen-long 提取 Markdown
-        chat_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-        headers_chat = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        payload = {
-            "model": "qwen-long",
-            "messages": [
-                {"role": "system", "content": "你是一个严谨的结构化数据提取工程师。请提取用户上传文档的全部内容，严格按 Markdown 格式输出。保留多级标题和表格。"},
-                {"role": "system", "content": f"fileid://{file_id}"},
-                {"role": "user", "content": "请全面解析这份文档。"}
-            ]
-        }
-        chat_res = requests.post(chat_url, headers=headers_chat, json=payload).json()
-        if "choices" not in chat_res:
-            raise Exception(f"大模型解析失败: {chat_res}")
-        markdown_content = chat_res["choices"][0]["message"]["content"]
+        # ⭐️ 关键修复 1：设置 300 秒（5分钟）的超长超时时间，防止大模型解析超时
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            with open(temp_file_path, "rb") as f:
+                files = {"file": (file.filename, f)}
+                response = await client.post(upload_url, headers=headers_upload, data=data, files=files)
+                upload_res = response.json()
+                
+            if "id" not in upload_res:
+                raise Exception(f"阿里云文件上传失败: {upload_res}")
+            file_id = upload_res["id"]
+
+            # 3. 调用 qwen-long 提取 Markdown
+            chat_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+            headers_chat = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            payload = {
+                "model": "qwen-long",
+                "messages": [
+                    {"role": "system", "content": "你是一个严谨的结构化数据提取工程师。请提取用户上传文档的全部内容，严格按 Markdown 格式输出。保留多级标题和表格。"},
+                    {"role": "system", "content": f"fileid://{file_id}"},
+                    {"role": "user", "content": "请全面解析这份文档。"}
+                ]
+            }
+            chat_res = (await client.post(chat_url, headers=headers_chat, json=payload)).json()
+            if "choices" not in chat_res:
+                raise Exception(f"大模型解析失败: {chat_res}")
+            markdown_content = chat_res["choices"][0]["message"]["content"]
 
         # 4. 语义切片
         headers_to_split_on = [("#", "一级标题"), ("##", "二级标题"), ("###", "三级标题")]
@@ -146,16 +225,21 @@ async def upload_document(file: UploadFile = File(...)):
         vectorstore.add_documents(final_splits)
         vectorstore.save_local("faiss_gb47372_index")
 
-        # 6. 清理临时文件
-        os.remove(temp_file_path)
-
         return {
             "status": "success", 
             "message": f"文件 {file.filename} 解析入库成功！共新增 {len(final_splits)} 个知识块。"
         }
 
     except Exception as e:
+        # ⭐️ 关键修复 2：打印详细堆栈到终端
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+        
+    finally:
+        # ⭐️ 关键修复 3：无论成功还是失败，都确保临时文件被清理
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
 # 3. 路由定义
 @app.post("/chat/stream")
 async def chat_stream_endpoint(request: ChatRequest):
@@ -166,12 +250,16 @@ async def chat_stream_endpoint(request: ChatRequest):
         config = {"configurable": {"thread_id": request.session_id}}
         input_message = HumanMessage(content=request.query)
         
-        async for event in graph_app.astream_events({"messages": [input_message]}, config=config, version="v2"):
-            kind = event["event"]
-            if kind == "on_chat_model_stream":
-                content = event["data"]["chunk"].content
-                if content:
-                    yield f"data: {json.dumps({'chunk': content}, ensure_ascii=False)}\n\n"
+        # ⭐️ 核心改进：使用异步上下文管理器动态连接数据库并编译图
+        async with AsyncSqliteSaver.from_conn_string("checkpoints.db") as memory:
+            graph_app = workflow.compile(checkpointer=memory)
+            
+            async for event in graph_app.astream_events({"messages": [input_message]}, config=config, version="v2"):
+                kind = event["event"]
+                if kind == "on_chat_model_stream":
+                    content = event["data"]["chunk"].content
+                    if content:
+                        yield f"data: {json.dumps({'chunk': content}, ensure_ascii=False)}\n\n"
         
         yield "data: [DONE]\n\n"
 
